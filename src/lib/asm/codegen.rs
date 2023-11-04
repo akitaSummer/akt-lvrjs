@@ -1,0 +1,2106 @@
+use crate::asm::chunk::*;
+use crate::asm::symtab::*;
+use crate::ast::*;
+use crate::lexer::*;
+use crate::parser::*;
+use crate::source::*;
+use crate::token::*;
+use crate::visitor::AstVisitor;
+use linked_hash_set::LinkedHashSet;
+use std::cmp::min;
+use std::collections::HashMap;
+use std::ptr::{drop_in_place, null_mut};
+use std::sync::Once;
+
+pub type FnStatePtr = *mut FnState;
+
+pub fn as_fn_state(ptr: FnStatePtr) -> &'static mut FnState {
+    unsafe { &mut (*ptr) }
+}
+
+pub const ENV_NAME: &'static str = "__ENV__";
+
+#[derive(Debug)]
+pub struct LoopInfo {
+    start: i32,
+    end: i32,
+    // index of break instructions in this loop
+    brk: Vec<i32>,
+    // index of continue instructions in this loop
+    cont: Vec<i32>,
+}
+
+#[derive(Debug)]
+pub struct FnState {
+    id: usize,
+    tpl: FnTpl,
+    parent: FnStatePtr,
+    idx_in_parent: u32,
+    // 局部变量名称映射到寄存器
+    local_reg_map: HashMap<String, u32>,
+    subs: Vec<FnStatePtr>,
+    // 可用的寄存器编号，用于分配新的寄存器
+    free_reg: u32,
+    // 结果寄存器
+    res_reg: Vec<u32>,
+    loop_stack: Vec<LoopInfo>,
+}
+
+fn fn_state_to_tpl(s: &FnState) -> FnTpl {
+    let mut tpl = s.tpl.clone();
+    s.subs.iter().for_each(|sp| {
+        let st = fn_state_to_tpl(as_fn_state(*sp));
+        tpl.fun_tpls.push(st);
+    });
+    tpl
+}
+
+impl FnState {
+    pub fn new(id: usize) -> FnStatePtr {
+        Box::into_raw(Box::new(FnState {
+            id,
+            tpl: FnTpl::new(),
+            parent: null_mut(),
+            idx_in_parent: 0,
+            local_reg_map: HashMap::new(),
+            subs: vec![],
+            free_reg: 0,
+            res_reg: vec![],
+            loop_stack: vec![],
+        }))
+    }
+
+    // 分配新的寄存器编号
+    pub fn take_reg(&mut self) -> u32 {
+        let r = self.free_reg;
+        self.free_reg += 1;
+        r
+    }
+
+    // 检查是否存在具有指定名称的局部变量
+    pub fn has_local(&self, n: &str) -> bool {
+        for v in &self.tpl.locals {
+            if v.name.eq(n) {
+                return true;
+            }
+        }
+        false
+    }
+
+    // 声明一个新的局部变量并将其映射到寄存器
+    pub fn def_local(&mut self, n: &str, reg: u32) {
+        self.tpl.locals.push(Local {
+            name: n.to_string(),
+        });
+        self.local_reg_map.insert(n.to_string(), reg);
+    }
+
+    // 获取指定局部变量名称对应的寄存器编号
+    pub fn local2reg(&self, n: &str) -> u32 {
+        *self.local_reg_map.get(n).unwrap()
+    }
+
+    // 检查是否存在具有指定名称的上值
+    pub fn has_upval(&self, n: &str) -> bool {
+        for uv in &self.tpl.upvals {
+            if uv.name.eq(n) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn get_upval(&self, n: &str) -> Option<&UpvalDesc> {
+        for uv in &self.tpl.upvals {
+            if uv.name.eq(n) {
+                return Some(uv);
+            }
+        }
+        None
+    }
+
+    // 获取指定名称的上值在上值数组中的索引
+    pub fn get_upval_idx(&self, n: &str) -> usize {
+        self.tpl.upvals.iter().position(|uv| uv.name.eq(n)).unwrap()
+    }
+
+    pub fn add_upval(&mut self, n: &str) -> bool {
+        if self.has_upval(n) {
+            return true;
+        }
+        let parent = self.parent;
+        if parent.is_null() {
+            if !self.has_upval(ENV_NAME) {
+                self.tpl.upvals.push(UpvalDesc {
+                    name: ENV_NAME.to_string(),
+                    in_stack: true,
+                    idx: 0,
+                });
+            }
+            return false;
+        } else {
+            let parent = as_fn_state(parent);
+            if parent.has_local(n) {
+                self.tpl.upvals.push(UpvalDesc {
+                    name: n.to_string(),
+                    in_stack: true,
+                    idx: parent.local2reg(n),
+                });
+                return true;
+            } else {
+                let is_up = parent.add_upval(n);
+                if is_up {
+                    self.tpl.upvals.push(UpvalDesc {
+                        name: n.to_string(),
+                        in_stack: false,
+                        idx: parent.get_upval_idx(n) as u32,
+                    });
+                    return true;
+                } else {
+                    self.add_upval(ENV_NAME);
+                    return false;
+                }
+            }
+        }
+    }
+
+    pub fn has_const(&self, c: &Const) -> bool {
+        for c1 in &self.tpl.consts {
+            if c1.eq(c) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn add_const(&mut self, c: &Const) {
+        if self.has_const(c) {
+            return;
+        }
+        self.tpl.consts.push(c.clone());
+    }
+
+    // 获取指定常量在常量数组中的索引
+    pub fn const2idx(&self, c: &Const) -> usize {
+        self.tpl.consts.iter().position(|c1| c1.eq(c)).unwrap()
+    }
+
+    // 追加一条指令
+    pub fn append_inst(&mut self, inst: Inst) {
+        self.tpl.code.push(inst);
+    }
+
+    fn push_res_reg(&mut self, r: u32) {
+        self.res_reg.push(r);
+    }
+
+    fn pop_res_reg(&mut self) -> (u32, bool) {
+        match self.res_reg.pop() {
+            Some(r) => (r, false),
+            None => (self.take_reg(), true),
+        }
+    }
+
+    fn push_inst(&mut self, c: Inst) {
+        self.tpl.code.push(c);
+    }
+
+    fn code_len(&self) -> i32 {
+        self.tpl.code.len() as i32
+    }
+
+    // 添加一条跳转指令
+    fn push_jmp(&mut self) -> i32 {
+        let mut jmp = Inst::new();
+        jmp.set_op(OpCode::JMP);
+        jmp.set_sbx(self.code_len() + 1);
+        self.push_inst(jmp);
+        self.code_len() - 1
+    }
+
+    //  完成之前添加的跳转指令，设置其跳转目标
+    fn fin_jmp(&mut self, idx: i32) {
+        let cl = self.code_len();
+        let jmp = self.tpl.code.get_mut(idx as usize).unwrap();
+        jmp.set_sbx(cl - jmp.sbx());
+    }
+
+    // 完成之前添加的跳转指令，设置其跳转目标为给定的偏移值
+    fn fin_jmp_sbx(&mut self, idx: i32, sbx: i32) {
+        let jmp = self.tpl.code.get_mut(idx as usize).unwrap();
+        jmp.set_sbx(sbx);
+    }
+
+    fn get_inst(&self, idx: i32) -> &Inst {
+        self.tpl.code.get(idx as usize).unwrap()
+    }
+
+    // 设置可用寄存器编号的最大值，以便释放不再需要的寄存器
+    fn free_reg_to(&mut self, r: u32) {
+        self.free_reg = r;
+    }
+
+    fn free_regs(&mut self, rs: &[u32]) {
+        if rs.len() > 0 {
+            let mut mr = std::u32::MAX;
+            for r in rs {
+                mr = min(mr, *r);
+            }
+            self.free_reg_to(mr);
+        }
+    }
+
+    fn get_sub(&mut self, idx: usize) -> &'static FnState {
+        as_fn_state(self.subs[0])
+    }
+
+    fn enter_loop(&mut self) {
+        self.loop_stack.push(LoopInfo {
+            start: self.code_len(),
+            end: 0,
+            brk: vec![],
+            cont: vec![],
+        })
+    }
+
+    // 完成 break 指令的跳转目标
+    fn fin_brk(&mut self) {
+        if self.loop_stack.last().is_none() {
+            return;
+        }
+        let info = self.loop_stack.last().unwrap();
+        let end = info.end;
+        for brk_idx in &info.brk {
+            let jmp = self.get_inst(*brk_idx);
+            let jmp_pc = jmp.sbx();
+            let ptr = jmp as *const Inst as *mut Inst;
+            unsafe {
+                (*ptr).set_sbx(end - jmp_pc);
+            }
+        }
+    }
+
+    // 完成 continue 指令的跳转目标
+    fn fin_cont(&mut self) {
+        if self.loop_stack.last().is_none() {
+            return;
+        }
+        let info = self.loop_stack.last().unwrap();
+        let start = info.start;
+        for cont_idx in &info.cont {
+            let jmp = self.get_inst(*cont_idx);
+            let jmp_pc = jmp.sbx();
+            let ptr = jmp as *const Inst as *mut Inst;
+            unsafe {
+                (*ptr).set_sbx(start - jmp_pc);
+            }
+        }
+    }
+
+    // 跟踪循环的开始和结束
+    fn leave_loop(&mut self) {
+        self.loop_stack.last_mut().unwrap().end = self.code_len();
+        self.fin_brk();
+        self.fin_cont();
+        self.loop_stack.pop();
+    }
+}
+
+// RK 值（Register or Konstant值）是用于表示常量或寄存器的一种值。它的目的是将常量和寄存器引用都表示为RK值，从而减少指令中的操作数数量和字节码的大小。
+pub fn kst_id_rk(id: usize) -> u32 {
+    assert!(id < 256);
+    (id | (1 << 8)) as u32
+}
+
+impl Drop for FnState {
+    fn drop(&mut self) {
+        for sub in &self.subs {
+            unsafe {
+                drop_in_place(*sub);
+            }
+        }
+    }
+}
+
+pub struct CodegenError {
+    msg: String,
+}
+
+impl CodegenError {
+    fn new(msg: &str) -> Self {
+        CodegenError {
+            msg: msg.to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Codegen {
+    scope_id_seed: usize,
+    fs: FnStatePtr,
+    symtab: SymTab,
+}
+
+impl Codegen {
+    pub fn new(symtab: SymTab) -> Self {
+        let fs = FnState::new(0);
+        Codegen {
+            scope_id_seed: 1,
+            fs,
+            symtab,
+        }
+    }
+
+    pub fn gen(code: &str) -> Chunk {
+        init_codegen_data();
+
+        let code = String::from(code);
+        let src = Source::new(&code);
+        let mut lexer = Lexer::new(src);
+        let mut parser = Parser::new(&mut lexer);
+        let ast = match parser.prog() {
+            Ok(node) => node,
+            Err(e) => panic!("{}", e.msg().to_owned()),
+        };
+
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+
+        let chk = Chunk {
+            sig: "js",
+            ver: 0x0001,
+            upval_cnt: 0,
+            fun_tpl: fn_state_to_tpl(codegen.fs_ref()),
+        };
+
+        chk
+    }
+
+    // 创建一个新的函数状态并将其设置为当前函数状态
+    fn enter_fn_state(&mut self) {
+        let cfs = self.fs_ref();
+        let fs = as_fn_state(FnState::new(self.scope_id_seed));
+        self.scope_id_seed += 1;
+        fs.parent = self.fs;
+        fs.idx_in_parent = cfs.subs.len() as u32;
+        cfs.subs.push(fs);
+        self.fs = fs;
+    }
+
+    fn leave_fn_state(&mut self) {
+        self.fs = as_fn_state(self.fs).parent;
+    }
+
+    fn fs_ref(&self) -> &'static mut FnState {
+        as_fn_state(self.fs)
+    }
+
+    fn symtab_scope(&self) -> &'static mut Scope {
+        let fs = as_fn_state(self.fs);
+        as_scope(self.symtab.get_scope(fs.id))
+    }
+
+    fn is_root_scope(&self) -> bool {
+        self.symtab_scope().id == 0
+    }
+
+    fn has_binding(&self, n: &str) -> bool {
+        self.symtab_scope().has_binding(n)
+    }
+
+    fn bindings(&self) -> &'static LinkedHashSet<String> {
+        &self.symtab_scope().bindings
+    }
+
+    // 在当前作用域中声明所有绑定，通常在作用域的入口处调用
+    fn declare_bindings(&mut self) {
+        let fs = self.fs_ref();
+
+        let bindings = self.bindings();
+        if bindings.len() > 0 {
+            let a = fs.take_reg() + self.symtab_scope().params.len() as u32;
+            let mut b = 0;
+            bindings.iter().for_each(|name| {
+                fs.def_local(name.as_str(), b);
+                b = fs.take_reg();
+            });
+            let mut inst = Inst::new();
+            inst.set_op(OpCode::LOADUNDEF);
+            inst.set_a(a);
+            inst.set_b(b - 1);
+            fs.push_inst(inst);
+            fs.free_reg_to(b);
+        }
+    }
+
+    // 处理一组语句，生成相应的字节码
+    fn stmts(&mut self, stmts: &Vec<Stmt>) -> Result<(), CodegenError> {
+        for stmt in stmts {
+            match self.stmt(stmt) {
+                Err(e) => return Err(e),
+                _ => (),
+            }
+        }
+        Ok(())
+    }
+
+    // 向当前函数状态的字节码中添加返回指令
+    fn append_ret_inst(&mut self) {
+        let mut ret = Inst::new();
+        ret.set_op(OpCode::RETURN);
+        ret.set_a(0);
+        ret.set_b(1);
+        self.fs_ref().push_inst(ret);
+    }
+}
+
+impl Drop for Codegen {
+    fn drop(&mut self) {
+        unsafe {
+            drop_in_place(self.fs);
+        }
+    }
+}
+// 将一个值设置为全局变量
+fn new_set_global_inst(fs: &mut FnState, field_name: &str, val_reg: u32) -> Inst {
+    let mut inst = Inst::new();
+    inst.set_op(OpCode::SETTABUP);
+    inst.set_a(fs.get_upval(ENV_NAME).unwrap().idx);
+    let kst = Const::String(field_name.to_string());
+    fs.add_const(&kst);
+    inst.set_b(kst_id_rk(fs.const2idx(&kst)));
+    inst.set_c(val_reg);
+    inst
+}
+
+// 处理变量赋值操作,如果目标上值已经存在,生成 SETUPVAL 指令将值分配给上值,否则,会生成 SETTABUP 指令将值分配给表中的元素。
+fn assign_upval(fs: &mut FnState, from_reg: u32, to_name: &str) -> Inst {
+    let has_def = fs.add_upval(to_name);
+    if has_def {
+        let mut inst = Inst::new();
+        inst.set_op(OpCode::SETUPVAL);
+        inst.set_b(fs.get_upval(to_name).unwrap().idx);
+        inst.set_a(from_reg);
+        inst
+    } else {
+        let mut inst = Inst::new();
+        inst.set_op(OpCode::SETTABUP);
+        inst.set_a(fs.get_upval(ENV_NAME).unwrap().idx);
+        let kst = Const::String(to_name.to_string());
+        fs.add_const(&kst);
+        inst.set_b(kst_id_rk(fs.const2idx(&kst)));
+        inst.set_c(from_reg);
+        inst
+    }
+}
+
+// 如果在生成某个表达式或语句的过程中生成了一个 LOADK 指令，而后又发现它不再需要，就可以使用这个函数来弹出该指令，以减小生成字节码的冗余
+fn pop_last_loadk(fs: &mut FnState) -> Option<u32> {
+    let last_inst = fs.tpl.code.last().unwrap();
+    let last_op = OpCode::from_u32(last_inst.op());
+    if last_op == OpCode::LOADK {
+        let last_inst = fs.tpl.code.pop().unwrap();
+        Some(last_inst.bx())
+    } else {
+        None
+    }
+}
+
+// 对stmt排序，进行函数声明提升，变量声明提升是通过调用declare_bindings实现的
+fn hoist(stmts: &Vec<Stmt>) -> Vec<Stmt> {
+    let mut not_fn = vec![];
+    let mut fns = vec![];
+    stmts.iter().for_each(|stmt| {
+        if stmt.is_fn() {
+            fns.push(stmt.clone());
+        } else {
+            not_fn.push(stmt.clone());
+        }
+    });
+    fns.append(&mut not_fn);
+    fns
+}
+
+impl AstVisitor<(), CodegenError> for Codegen {
+    fn prog(&mut self, prog: &Prog) -> Result<(), CodegenError> {
+        unsafe {
+            if !IS_MOD_INITIALIZED {
+                return Err(CodegenError::new(
+                    "`init_codegen_data` should be called before this method",
+                ));
+            }
+        }
+        // 这里不使用self.declare_bindings()因为我们不能在根作用域中声明值，根作用域中的值只是全局对象字段的别名
+        let stmts = hoist(&prog.body);
+        match self.stmts(&stmts) {
+            Err(e) => return Err(e),
+            _ => (),
+        }
+        self.append_ret_inst();
+        Ok(())
+    }
+
+    fn block_stmt(&mut self, stmt: &BlockStmt) -> Result<(), CodegenError> {
+        let stmts = hoist(&stmt.body);
+        self.stmts(&stmts)
+    }
+
+    fn var_dec_stmt(&mut self, stmt: &VarDec) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        stmt.decs.iter().for_each(|dec| {
+            if let Some(init) = &dec.init {
+                let n = dec.id.id().name.as_str();
+                if fs.has_local(n) {
+                    fs.push_res_reg(fs.local2reg(n));
+                    self.expr(&init).ok();
+                } else {
+                    let mut tmp_regs = vec![];
+                    let tmp_reg = fs.take_reg();
+                    fs.push_res_reg(tmp_reg);
+                    self.expr(&init).ok();
+                    let rk = if let Some(r) = pop_last_loadk(fs) {
+                        fs.free_reg_to(tmp_reg);
+                        r
+                    } else {
+                        tmp_regs.push(tmp_reg);
+                        tmp_reg
+                    };
+
+                    let inst = assign_upval(fs, rk, n);
+                    fs.push_inst(inst);
+                    fs.free_regs(&tmp_regs);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn empty_stmt(&mut self, stmt: &EmptyStmt) -> Result<(), CodegenError> {
+        Ok(())
+    }
+
+    fn expr_stmt(&mut self, stmt: &ExprStmt) -> Result<(), CodegenError> {
+        self.expr(&stmt.expr).ok();
+        Ok(())
+    }
+
+    fn if_stmt(&mut self, stmt: &IfStmt) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        let tr = fs.take_reg();
+        fs.push_res_reg(tr);
+        self.expr(&stmt.test).ok();
+
+        let mut test = Inst::new();
+        test.set_op(OpCode::TEST);
+        test.set_a(tr);
+        test.set_c(1);
+        fs.push_inst(test);
+        fs.free_reg_to(tr);
+
+        // jmp to false
+        let jmp1 = fs.push_jmp();
+        self.stmt(&stmt.cons).ok();
+
+        if let Some(alt) = &stmt.alt {
+            // jmp over false
+            let jmp2 = fs.push_jmp();
+            fs.fin_jmp(jmp1);
+            self.stmt(&alt).ok();
+            fs.fin_jmp(jmp2);
+        } else {
+            fs.fin_jmp(jmp1);
+        }
+
+        Ok(())
+    }
+
+    fn for_stmt(&mut self, stmt: &ForStmt) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        fs.enter_loop();
+
+        if let Some(init) = &stmt.init {
+            match init {
+                ForFirst::VarDec(dec) => self.var_dec_stmt(dec).ok(),
+                ForFirst::Expr(expr) => self.expr(expr).ok(),
+            };
+        }
+
+        let s_len = fs.code_len();
+        fs.loop_stack.last_mut().unwrap().start = s_len;
+
+        let tr = fs.take_reg();
+        if let Some(test) = &stmt.test {
+            fs.push_res_reg(tr);
+            self.expr(test).ok();
+        } else {
+            let mut b = Inst::new();
+            b.set_op(OpCode::LOADBOO);
+            b.set_a(tr);
+            b.set_b(1);
+            fs.push_inst(b);
+        }
+
+        let mut t = Inst::new();
+        t.set_op(OpCode::TEST);
+        t.set_a(tr);
+        t.set_c(1);
+        fs.push_inst(t);
+        fs.free_reg_to(tr);
+
+        // jmp out of loop
+        let jmp1 = fs.push_jmp();
+
+        self.stmt(&stmt.body).ok();
+
+        if let Some(update) = &stmt.update {
+            self.expr(update).ok();
+        }
+
+        // jmp to the loop start
+        let jmp2 = fs.push_jmp();
+        fs.fin_jmp(jmp1);
+
+        let e_len = fs.code_len();
+        fs.fin_jmp_sbx(jmp2, s_len - e_len);
+        fs.leave_loop();
+        Ok(())
+    }
+
+    fn for_in_stmt(&mut self, stmt: &ForInStmt) -> Result<(), CodegenError> {
+        unimplemented!()
+    }
+
+    fn do_while_stmt(&mut self, stmt: &DoWhileStmt) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        fs.enter_loop();
+
+        let s_len = fs.code_len();
+        self.stmt(&stmt.body).ok();
+
+        let tr = fs.take_reg();
+        fs.push_res_reg(tr);
+        self.expr(&stmt.test).ok();
+        fs.free_reg_to(tr);
+
+        let mut t = Inst::new();
+        t.set_op(OpCode::TEST);
+        t.set_a(tr);
+        t.set_c(0);
+        fs.push_inst(t);
+
+        // jmp out of loop
+        let jmp1 = fs.push_jmp();
+        let e_len = fs.code_len();
+        fs.fin_jmp_sbx(jmp1, s_len - e_len);
+        fs.leave_loop();
+        Ok(())
+    }
+
+    fn while_stmt(&mut self, stmt: &WhileStmt) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        fs.enter_loop();
+
+        let s_len = fs.code_len();
+
+        let tr = fs.take_reg();
+        fs.push_res_reg(tr);
+        self.expr(&stmt.test).ok();
+        fs.free_reg_to(tr);
+
+        let mut t = Inst::new();
+        t.set_op(OpCode::TEST);
+        t.set_a(tr);
+        t.set_c(1);
+        fs.push_inst(t);
+
+        // jmp out of loop
+        let jmp1 = fs.push_jmp();
+        self.stmt(&stmt.body).ok();
+
+        // jmp to the loop start
+        let jmp2 = fs.push_jmp();
+        fs.fin_jmp(jmp1);
+
+        let e_len = fs.code_len();
+        fs.fin_jmp_sbx(jmp2, s_len - e_len);
+        fs.leave_loop();
+        Ok(())
+    }
+
+    fn cont_stmt(&mut self, stmt: &ContStmt) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        let len = fs.code_len();
+        let mut inst = Inst::new();
+        inst.set_op(OpCode::JMP);
+        inst.set_sbx(len + 1);
+        fs.push_inst(inst);
+        fs.loop_stack.last_mut().unwrap().cont.push(len);
+        Ok(())
+    }
+
+    fn break_stmt(&mut self, stmt: &BreakStmt) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        let len = fs.code_len();
+        let mut inst = Inst::new();
+        inst.set_op(OpCode::JMP);
+        inst.set_sbx(len + 1);
+        fs.push_inst(inst);
+        fs.loop_stack.last_mut().unwrap().brk.push(len);
+        Ok(())
+    }
+
+    fn ret_stmt(&mut self, stmt: &ReturnStmt) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+
+        let mut ret = Inst::new();
+        ret.set_op(OpCode::RETURN);
+
+        if let Some(arg) = &stmt.argument {
+            let tr = fs.take_reg();
+            fs.push_res_reg(tr);
+            self.expr(arg).ok();
+            ret.set_a(tr);
+            ret.set_b(2);
+            fs.free_reg_to(tr);
+        }
+
+        fs.push_inst(ret);
+        Ok(())
+    }
+
+    fn with_stmt(&mut self, stmt: &WithStmt) -> Result<(), CodegenError> {
+        unimplemented!()
+    }
+
+    fn switch_stmt(&mut self, stmt: &SwitchStmt) -> Result<(), CodegenError> {
+        unimplemented!()
+    }
+
+    fn throw_stmt(&mut self, stmt: &ThrowStmt) -> Result<(), CodegenError> {
+        unimplemented!()
+    }
+
+    fn try_stmt(&mut self, stmt: &TryStmt) -> Result<(), CodegenError> {
+        unimplemented!()
+    }
+
+    fn debug_stmt(&mut self, stmt: &DebugStmt) -> Result<(), CodegenError> {
+        unimplemented!()
+    }
+
+    fn fn_stmt(&mut self, stmt: &FnDec) -> Result<(), CodegenError> {
+        // 没有 id 的函数是没有意义的，因为它不能稍后调用，所以在这种情况下我们可以跳过生成它的指令
+        if stmt.id.is_none() {
+            return Ok(());
+        }
+
+        let id = stmt.id.as_ref().unwrap().id().name.as_str();
+        let pfs = self.fs_ref();
+
+        self.enter_fn_state();
+        let cfs = self.fs_ref();
+        let ra = if pfs.has_local(id) {
+            pfs.local2reg(id)
+        } else {
+            pfs.take_reg()
+        };
+
+        let mut inst = Inst::new();
+        inst.set_op(OpCode::CLOSURE);
+        inst.set_a(ra);
+        inst.set_bx(cfs.idx_in_parent);
+        pfs.push_inst(inst);
+
+        if !pfs.has_local(id) {
+            let inst = assign_upval(pfs, ra, id);
+            pfs.push_inst(inst);
+            pfs.free_reg_to(ra);
+        }
+
+        self.declare_bindings();
+        self.stmt(&stmt.body).ok();
+        self.append_ret_inst();
+
+        self.leave_fn_state();
+        Ok(())
+    }
+
+    fn member_expr(&mut self, expr: &MemberExpr) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        let mut inst = Inst::new();
+        let tr = fs.take_reg();
+        fs.push_res_reg(tr);
+        self.expr(&expr.object).ok();
+        tmp_regs.push(tr);
+
+        inst.set_op(OpCode::GETTABLE);
+        inst.set_a(res_reg);
+        inst.set_b(tr);
+
+        if expr.computed {
+            let tr = fs.take_reg();
+            fs.push_res_reg(tr);
+            self.expr(&expr.property).ok();
+            tmp_regs.push(tr);
+            inst.set_c(tr);
+        } else {
+            let n = expr.property.primary().id().name.as_str();
+            let kst = Const::new_str(n);
+            fs.add_const(&kst);
+            inst.set_c(kst_id_rk(fs.const2idx(&kst)));
+        }
+
+        fs.push_inst(inst);
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    fn new_expr(&mut self, expr: &NewExpr) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        let a = fs.take_reg();
+        fs.push_res_reg(a);
+        self.expr(&expr.callee).ok();
+        tmp_regs.push(a);
+
+        expr.arguments.iter().for_each(|arg| {
+            let r = fs.take_reg();
+            fs.push_res_reg(r);
+            self.expr(arg).ok();
+            tmp_regs.push(r);
+        });
+
+        let mut call = Inst::new();
+        call.set_op(OpCode::NEW);
+        call.set_a(a);
+        call.set_b((expr.arguments.len() + 1) as u32);
+
+        let ret_num = if is_tmp { 1 } else { 2 };
+        call.set_c(ret_num);
+        fs.push_inst(call);
+
+        if !is_tmp && a != res_reg {
+            let mut mov = Inst::new();
+            mov.set_op(OpCode::MOVE);
+            mov.set_a(res_reg);
+            mov.set_b(a);
+            fs.push_inst(mov);
+        }
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    fn call_expr(&mut self, expr: &CallExpr) -> Result<(), CodegenError> {
+        // 与 Lua 不同，JS 不支持多个返回值，也没有 VARARG（直到 ES5，ES6 中的 RestParameter 等于 Lua 中的 VARARG）。然而，这并不意味着 ES5 中 CALL 中的 B 不能为 0
+        // 使用这种能力来实现 Function.prototype.apply
+
+        let fs = self.fs_ref();
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        let a = fs.take_reg();
+        fs.push_res_reg(a);
+        self.expr(&expr.callee).ok();
+        tmp_regs.push(a);
+
+        expr.arguments.iter().for_each(|arg| {
+            let r = fs.take_reg();
+            fs.push_res_reg(r);
+            self.expr(arg).ok();
+            tmp_regs.push(r);
+        });
+
+        let mut call = Inst::new();
+        call.set_op(OpCode::CALL);
+        call.set_a(a);
+        call.set_b((expr.arguments.len() + 1) as u32);
+
+        let ret_num = if is_tmp { 1 } else { 2 };
+        call.set_c(ret_num);
+        fs.push_inst(call);
+
+        if !is_tmp && a != res_reg {
+            let mut mov = Inst::new();
+            mov.set_op(OpCode::MOVE);
+            mov.set_a(res_reg);
+            mov.set_b(a);
+            fs.push_inst(mov);
+        }
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    // 处理一元表达式
+    fn unary_expr(&mut self, expr: &UnaryExpr) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        let sym = expr.op.symbol_data().kind;
+        match sym {
+            Symbol::Sub | Symbol::Not | Symbol::BitNot => {
+                let op = match sym {
+                    Symbol::Sub => OpCode::UNM,
+                    Symbol::Not => OpCode::NOT,
+                    Symbol::BitNot => OpCode::BITNOT,
+                    _ => panic!(),
+                };
+
+                let mut inst = Inst::new();
+                inst.set_op(op);
+                inst.set_a(res_reg);
+
+                let tr = fs.take_reg();
+                fs.push_res_reg(tr);
+                self.expr(&expr.argument).ok();
+                if let Some(r) = pop_last_loadk(fs) {
+                    inst.set_b(r);
+                } else {
+                    inst.set_b(tr);
+                }
+                fs.push_inst(inst);
+                fs.free_regs(&tmp_regs);
+            }
+            Symbol::Inc | Symbol::Dec => {
+                let op_tok = if sym == Symbol::Inc {
+                    Token::Symbol(SymbolData {
+                        kind: Symbol::AssignAdd,
+                        loc: SourceLoc::new(),
+                    })
+                } else {
+                    Token::Symbol(SymbolData {
+                        kind: Symbol::AssignSub,
+                        loc: SourceLoc::new(),
+                    })
+                };
+
+                if !expr.prefix {
+                    // 如果 expr 是后缀，我们应该计算参数的值并将计算结果移至结果寄存器
+                    let m_b = fs.take_reg();
+                    fs.push_res_reg(m_b);
+                    self.expr(&expr.argument).ok();
+                    tmp_regs.push(m_b);
+
+                    if !is_tmp {
+                        let mut mov = Inst::new();
+                        mov.set_op(OpCode::MOVE);
+                        mov.set_a(res_reg);
+                        mov.set_b(m_b);
+                        fs.push_inst(mov);
+                    }
+                }
+
+                let assign: Expr = AssignExpr {
+                    loc: SourceLoc::new(),
+                    op: op_tok,
+                    left: expr.argument.clone(),
+                    right: PrimaryExpr::Literal(Literal::Numeric(NumericData::new(
+                        SourceLoc::new(),
+                        "1".to_owned(),
+                    )))
+                    .into(),
+                }
+                .into();
+
+                //  如果expr是前缀，我们应该将结果寄存器压入res_reg_stack，让匿名赋值将其结果放入其中
+                if expr.prefix {
+                    fs.push_res_reg(res_reg);
+                }
+                self.expr(&assign).ok();
+                fs.free_regs(&tmp_regs);
+            }
+            _ => panic!(),
+        }
+        Ok(())
+    }
+
+    fn binary_expr(&mut self, expr: &BinaryExpr) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        let op_s = expr.op.symbol_data().kind;
+
+        let mut inst = Inst::new();
+
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        inst.set_a(res_reg);
+        match symbol_to_opcode(op_s) {
+            Some(op) => inst.set_op(*op),
+            _ => unimplemented!(),
+        }
+
+        let r_lhs = fs.take_reg();
+        fs.push_res_reg(r_lhs);
+        self.expr(&expr.left).ok();
+        if let Some(rb) = pop_last_loadk(fs) {
+            inst.set_b(rb);
+            fs.free_reg_to(r_lhs);
+        } else {
+            inst.set_b(r_lhs);
+            tmp_regs.push(r_lhs);
+        }
+
+        let r_rhs = fs.take_reg();
+        fs.push_res_reg(r_rhs);
+        self.expr(&expr.right).ok();
+        if let Some(rc) = pop_last_loadk(fs) {
+            inst.set_c(rc);
+            fs.free_reg_to(r_rhs);
+        } else {
+            inst.set_c(r_rhs);
+            tmp_regs.push(r_rhs);
+        }
+
+        fs.push_inst(inst);
+        fs.free_regs(&tmp_regs);
+
+        match op_s {
+            Symbol::LT
+            | Symbol::LE
+            | Symbol::Eq
+            | Symbol::EqStrict
+            | Symbol::GT
+            | Symbol::GE
+            | Symbol::NotEq
+            | Symbol::NotEqStrict => {
+                match op_s {
+                    Symbol::LT | Symbol::LE | Symbol::Eq | Symbol::EqStrict => {
+                        fs.tpl.code.last_mut().unwrap().set_a(1)
+                    }
+                    _ => fs.tpl.code.last_mut().unwrap().set_a(0),
+                }
+
+                let mut lb1 = Inst::new();
+                lb1.set_op(OpCode::LOADBOO);
+                lb1.set_a(res_reg);
+                lb1.set_b(1);
+                lb1.set_c(1);
+                fs.push_inst(lb1);
+
+                let mut lb2 = Inst::new();
+                lb2.set_op(OpCode::LOADBOO);
+                lb2.set_a(res_reg);
+                lb2.set_b(0);
+                fs.push_inst(lb2);
+            }
+            Symbol::And | Symbol::Or => {
+                let test_set = fs.tpl.code.last_mut().unwrap();
+                let lhs_reg = test_set.b();
+                let rhs_reg = test_set.c();
+                test_set.set_c(if op_s == Symbol::And { 1 } else { 0 });
+
+                let mut jmp = Inst::new();
+                jmp.set_op(OpCode::JMP);
+                jmp.set_sbx(1);
+                fs.push_inst(jmp);
+
+                let mut mov = Inst::new();
+                mov.set_op(OpCode::MOVE);
+                mov.set_a(res_reg);
+                mov.set_b(rhs_reg);
+                fs.push_inst(mov);
+            }
+            _ => (),
+        }
+
+        Ok(())
+    }
+
+    fn assign_expr(&mut self, expr: &AssignExpr) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+
+        let mut tmp_regs = vec![];
+        let (res_reg, is_res_tmp) = fs.pop_res_reg();
+        if is_res_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        let mut rc = fs.take_reg();
+        fs.push_res_reg(rc);
+        self.expr(&expr.right).ok();
+        if let Some(r) = pop_last_loadk(fs) {
+            fs.free_reg_to(rc);
+            rc = r;
+        } else {
+            tmp_regs.push(rc);
+        }
+
+        let mut inst = Inst::new();
+        match &expr.left {
+            Expr::Primary(pri) => {
+                if !pri.is_id() {
+                    return Err(CodegenError::new("lhs must be LVal"));
+                }
+                let id = pri.id().name.as_str();
+                if fs.has_local(id) {
+                    inst.set_op(OpCode::MOVE);
+                    inst.set_a(fs.local2reg(id));
+                } else {
+                    inst = assign_upval(fs, 0, id);
+                }
+            }
+            Expr::Member(m) => {
+                inst.set_op(OpCode::SETTABLE);
+                let tr = fs.take_reg();
+                fs.push_res_reg(tr);
+                self.expr(&m.object).ok();
+                inst.set_a(tr);
+                tmp_regs.push(tr);
+
+                if m.computed {
+                    let rb = fs.take_reg();
+                    fs.push_res_reg(rb);
+                    self.expr(&m.property).ok();
+                    tmp_regs.push(rb);
+                    inst.set_b(rb);
+                } else {
+                    let n = m.property.primary().id().name.as_str();
+                    let kst = Const::new_str(n);
+                    fs.add_const(&kst);
+                    inst.set_b(kst_id_rk(fs.const2idx(&kst)));
+                }
+            }
+            _ => return Err(CodegenError::new("lhs must be LVal")),
+        }
+
+        // is `operator=`
+        if !expr.op.is_symbol_kind(Symbol::Assign) {
+            let rb = fs.take_reg();
+            fs.push_res_reg(rb);
+            self.expr(&expr.left).ok();
+            tmp_regs.push(rb);
+
+            let ra = fs.take_reg();
+            let mut binop = Inst::new();
+            binop.set_op(*symbol_to_opcode(expr.op.symbol_data().kind).unwrap());
+            binop.set_a(ra);
+            binop.set_b(rb);
+            binop.set_c(rc);
+            fs.push_inst(binop);
+            tmp_regs.push(ra);
+            rc = ra;
+        }
+
+        let op = OpCode::from_u32(inst.op());
+        match op {
+            OpCode::MOVE => inst.set_b(rc),
+            OpCode::SETUPVAL => inst.set_a(rc),
+            OpCode::SETTABLE | OpCode::SETTABUP => inst.set_c(rc),
+            _ => panic!(),
+        }
+        fs.push_inst(inst);
+
+        if !is_res_tmp {
+            let mut mov = Inst::new();
+            mov.set_op(OpCode::MOVE);
+            mov.set_a(res_reg);
+            mov.set_b(rc);
+            fs.push_inst(mov);
+        }
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    fn cond_expr(&mut self, expr: &CondExpr) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        let tr = fs.take_reg();
+        fs.push_res_reg(tr);
+        self.expr(&expr.test).ok();
+        tmp_regs.push(tr);
+
+        let mut test = Inst::new();
+        test.set_op(OpCode::TESTSET);
+        test.set_a(tr);
+        test.set_c(0);
+        fs.push_inst(test);
+
+        let jmp1 = fs.push_jmp();
+        fs.push_res_reg(res_reg);
+        self.expr(&expr.cons).ok();
+
+        let jmp2 = fs.push_jmp();
+        fs.fin_jmp(jmp1);
+
+        fs.push_res_reg(res_reg);
+        self.expr(&expr.alt).ok();
+        fs.fin_jmp(jmp2);
+
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    fn seq_expr(&mut self, expr: &SeqExpr) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        let len = expr.exprs.len();
+        expr.exprs.iter().enumerate().for_each(|(i, expr)| {
+            if i == len - 1 {
+                fs.push_res_reg(res_reg);
+            } else {
+                let tmp_reg = fs.take_reg();
+                fs.push_res_reg(tmp_reg);
+                tmp_regs.push(tmp_reg);
+            }
+            self.expr(expr).ok();
+        });
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    fn this_expr(&mut self, expr: &ThisExprData) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+        let mut this = Inst::new();
+        this.set_op(OpCode::THIS);
+        this.set_a(res_reg);
+        fs.push_inst(this);
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    fn id_expr(&mut self, expr: &IdData) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        let n = expr.name.as_str();
+
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        if fs.has_local(n) {
+            let mut inst = Inst::new();
+            inst.set_op(OpCode::MOVE);
+            inst.set_a(res_reg);
+            inst.set_b(fs.local2reg(n));
+            fs.push_inst(inst);
+        } else {
+            let has_def = fs.add_upval(n);
+            if has_def {
+                let mut inst = Inst::new();
+                inst.set_op(OpCode::GETUPVAL);
+                inst.set_a(res_reg);
+                inst.set_b(fs.get_upval_idx(n) as u32);
+                fs.push_inst(inst);
+            } else {
+                let kst = Const::String(n.to_string());
+                fs.add_const(&kst);
+                let mut inst = Inst::new();
+                inst.set_op(OpCode::GETTABUP);
+                inst.set_a(res_reg);
+                inst.set_b(fs.get_upval(ENV_NAME).unwrap().idx);
+                inst.set_c(kst_id_rk(fs.const2idx(&kst)));
+                fs.push_inst(inst);
+            }
+        }
+
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    fn array_literal(&mut self, expr: &ArrayData) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        let mut inst = Inst::new();
+        inst.set_op(OpCode::NEWARRAY);
+
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        inst.set_a(res_reg);
+        fs.push_inst(inst);
+
+        if expr.value.len() > 0 {
+            let mut i = 0;
+            expr.value.iter().for_each(|expr| {
+                let r = fs.take_reg();
+                tmp_regs.push(r);
+                fs.push_res_reg(r);
+                self.expr(expr).ok();
+                i += 1;
+            });
+            let mut inst = Inst::new();
+            inst.set_op(OpCode::INITARRAY);
+            inst.set_a(res_reg);
+            inst.set_b(i);
+            fs.push_inst(inst);
+        }
+
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    fn object_literal(&mut self, expr: &ObjectData) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+        let mut inst = Inst::new();
+        inst.set_op(OpCode::NEWTABLE);
+
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        inst.set_a(res_reg);
+        fs.push_inst(inst);
+
+        if expr.properties.len() > 0 {
+            expr.properties.iter().for_each(|prop| {
+                let kst = if prop.key.primary().is_id() {
+                    Const::String(prop.key.primary().id().name.clone())
+                } else {
+                    Const::String(prop.key.primary().literal().str().value.clone())
+                };
+                fs.add_const(&kst);
+
+                let mut inst = Inst::new();
+                inst.set_op(OpCode::SETTABLE);
+                inst.set_a(res_reg);
+                inst.set_b(kst_id_rk(fs.const2idx(&kst)));
+
+                let r = fs.take_reg();
+                tmp_regs.push(r);
+                fs.push_res_reg(r);
+                inst.set_c(r);
+
+                self.expr(&prop.value).ok();
+                fs.push_inst(inst);
+            });
+        }
+
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    fn paren_expr(&mut self, expr: &ParenData) -> Result<(), CodegenError> {
+        self.expr(&expr.value).ok();
+        Ok(())
+    }
+
+    fn fn_expr(&mut self, expr: &FnDec) -> Result<(), CodegenError> {
+        let pfs = self.fs_ref();
+        let (res_reg, is_tmp) = pfs.pop_res_reg();
+        assert!(!is_tmp);
+
+        self.enter_fn_state();
+        let cfs = self.fs_ref();
+
+        let mut inst = Inst::new();
+        inst.set_op(OpCode::CLOSURE);
+        inst.set_a(res_reg);
+        inst.set_bx(cfs.idx_in_parent);
+        pfs.push_inst(inst);
+
+        self.declare_bindings();
+        self.stmt(&expr.body).ok();
+        self.append_ret_inst();
+
+        self.leave_fn_state();
+        Ok(())
+    }
+
+    fn regexp_expr(&mut self, expr: &RegExpData) -> Result<(), CodegenError> {
+        unimplemented!()
+    }
+
+    fn null_expr(&mut self, expr: &NullData) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        let mut inst = Inst::new();
+        inst.set_op(OpCode::LOADNUL);
+        inst.set_a(res_reg);
+        fs.push_inst(inst);
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    fn undef_expr(&mut self, expr: &UndefData) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        let mut inst = Inst::new();
+        inst.set_op(OpCode::LOADUNDEF);
+        inst.set_a(res_reg);
+        fs.push_inst(inst);
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    fn str_expr(&mut self, expr: &StringData) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        let kst = Const::String(expr.value.clone());
+        fs.add_const(&kst);
+        let mut inst = Inst::new();
+        inst.set_op(OpCode::LOADK);
+        inst.set_a(res_reg);
+        inst.set_bx(kst_id_rk(fs.const2idx(&kst)));
+        fs.push_inst(inst);
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    fn bool_expr(&mut self, expr: &BoolData) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        let mut inst = Inst::new();
+        inst.set_op(OpCode::LOADBOO);
+        inst.set_a(res_reg);
+        inst.set_b(if expr.value { 1 } else { 0 });
+        fs.push_inst(inst);
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+
+    fn num_expr(&mut self, expr: &NumericData) -> Result<(), CodegenError> {
+        let fs = self.fs_ref();
+
+        let mut tmp_regs = vec![];
+        let (res_reg, is_tmp) = fs.pop_res_reg();
+        if is_tmp {
+            tmp_regs.push(res_reg)
+        }
+
+        let kst = Const::Number(expr.value.parse().ok().unwrap());
+        fs.add_const(&kst);
+        let mut inst = Inst::new();
+        inst.set_op(OpCode::LOADK);
+        inst.set_a(res_reg);
+        inst.set_bx(kst_id_rk(fs.const2idx(&kst)));
+        fs.push_inst(inst);
+        fs.free_regs(&tmp_regs);
+        Ok(())
+    }
+}
+
+static mut SYMBOL_OPCODE_MAP: Option<HashMap<Symbol, OpCode>> = None;
+
+fn symbol_to_opcode(s: Symbol) -> Option<&'static OpCode> {
+    unsafe { SYMBOL_OPCODE_MAP.as_ref().unwrap().get(&s) }
+}
+
+fn init_symbol_opcode_map() {
+    let mut map = HashMap::new();
+    map.insert(Symbol::Add, OpCode::ADD);
+    map.insert(Symbol::Sub, OpCode::SUB);
+    map.insert(Symbol::Mul, OpCode::MUL);
+    map.insert(Symbol::Mod, OpCode::MOD);
+    map.insert(Symbol::Div, OpCode::DIV);
+    map.insert(Symbol::LT, OpCode::LT);
+    map.insert(Symbol::GT, OpCode::LE);
+    map.insert(Symbol::LE, OpCode::LE);
+    map.insert(Symbol::GE, OpCode::LT);
+    map.insert(Symbol::Eq, OpCode::EQ);
+    map.insert(Symbol::NotEq, OpCode::EQ);
+    map.insert(Symbol::EqStrict, OpCode::EQS);
+    map.insert(Symbol::NotEqStrict, OpCode::EQS);
+    map.insert(Symbol::BitAnd, OpCode::BITAND);
+    map.insert(Symbol::BitOr, OpCode::BITOR);
+    map.insert(Symbol::BitNot, OpCode::BITNOT);
+    map.insert(Symbol::SHL, OpCode::SHL);
+    map.insert(Symbol::SAR, OpCode::SAR);
+    map.insert(Symbol::SHR, OpCode::SHR);
+    map.insert(Symbol::And, OpCode::TESTSET);
+    map.insert(Symbol::Or, OpCode::TESTSET);
+    map.insert(Symbol::AssignAdd, OpCode::ADD);
+    map.insert(Symbol::AssignSub, OpCode::SUB);
+    map.insert(Symbol::AssignMul, OpCode::MUL);
+    map.insert(Symbol::AssignDiv, OpCode::DIV);
+    map.insert(Symbol::AssignMod, OpCode::MOD);
+    map.insert(Symbol::AssignSHL, OpCode::SHL);
+    map.insert(Symbol::AssignSAR, OpCode::SAR);
+    map.insert(Symbol::AssignSHR, OpCode::SHR);
+    map.insert(Symbol::AssignBitAnd, OpCode::BITAND);
+    map.insert(Symbol::AssignBitOr, OpCode::BITOR);
+    map.insert(Symbol::AssignBitXor, OpCode::BITXOR);
+    unsafe {
+        SYMBOL_OPCODE_MAP = Some(map);
+    }
+}
+
+static mut IS_MOD_INITIALIZED: bool = false;
+
+static INIT_CODEGEN_DATA_ONCE: Once = Once::new();
+pub fn init_codegen_data() {
+    INIT_CODEGEN_DATA_ONCE.call_once(|| {
+        init_token_data();
+        init_opcode_data();
+        init_symbol_opcode_map();
+        unsafe {
+            IS_MOD_INITIALIZED = true;
+        }
+    });
+}
+
+#[cfg(test)]
+mod codegen_tests {
+    use super::*;
+
+    fn parse(code: &str) -> Prog {
+        init_codegen_data();
+
+        let code = String::from(code);
+        let src = Source::new(&code);
+        let mut lexer = Lexer::new(src);
+        let mut parser = Parser::new(&mut lexer);
+        let ast = parser.prog().ok().unwrap();
+        ast
+    }
+
+    fn assert_code_eq(asert: &str, test: &Vec<Inst>) {
+        let mut t = String::new();
+        test.iter().for_each(|inst| {
+            t.push_str("    ");
+            t.push_str(format!("{:#?}", inst).as_str());
+            t.push_str(",\n");
+        });
+        assert_eq!(asert.trim(), t.trim());
+    }
+
+    #[test]
+    fn gen_test() {
+        let ast = parse("var a; if(1) var b else var c");
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn kst_test() {
+        let ast = parse(
+            "
+    var a = 'hello world', 
+        b = 1, 
+        c = true,
+        e = null
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn id_test() {
+        let ast = parse(
+            "
+    var a = 'hello world'
+    var b = a
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn arr_literal_test() {
+        let ast = parse(
+            "
+    var a = [1, 2, 3, [4, 5]]
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn tbl_literal_test() {
+        let ast = parse(
+            "
+        var a = {
+          b: 1,
+          c: [ {d: 2}, , undefined, null ],
+          e: { 'f': 3 }
+        }
+        ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn binop_kst() {
+        let ast = parse(
+            "
+        var a = 1
+        var b = a
+        var c = b + 2
+        ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn binop_test() {
+        let ast = parse(
+            "
+        var a,b;
+        var c = a + 2 * b / 3
+        ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn seq_test() {
+        let ast = parse(
+            "
+        var a,b;
+        var c = (1,2,a+b,b)
+        ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn closure_test() {
+        let ast = parse(
+            "
+    function a() {
+      var a = b;
+      function b() {}
+    }
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn relation_test() {
+        let ast = parse(
+            "
+    var c = a == b
+    var d = c
+    var e = d != f
+    var f = a < b
+    var f = a > b
+    var f = a >> 1
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn and_or_test() {
+        let ast = parse(
+            "
+    var c = a && b
+    var d = e || f
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn assign_test() {
+        let ast = parse(
+            "
+    c = a + b
+    e.f = 1 + 2
+    a = b = 1
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn binop_assign_test() {
+        let ast = parse(
+            "
+    a.b += c + 2
+    e += 1
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn unary_test() {
+        let ast = parse(
+            "
+    a = a & ~b
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn postfix_expr_test() {
+        let ast = parse(
+            "
+    a += a++ + ++a
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn cond_expr_test() {
+        let ast = parse(
+            "
+    a = a ? a +=1 : a +=2
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn fn_expr_test() {
+        let ast = parse(
+            "
+    a = function f() {
+      var a = function () {}
+    }
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn global_var_test() {
+        let ast = parse(
+            "
+    var a = 1
+    function f() {
+      return a
+    }
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn if_stmt_test() {
+        let ast = parse(
+            "
+    if (a) {
+      a
+      b
+    }
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn if_stmt_test2() {
+        let ast = parse(
+            "
+    if (a) {
+      a
+      b
+    } else {
+      c
+      d
+    }
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn if_stmt_test3() {
+        let ast = parse(
+            "
+    if (a) {
+      a
+    } else if(b) {
+      c
+    } else { d }
+    f
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn for_stmt_test() {
+        let ast = parse(
+            "
+    for(i = 0; i + a < 10; i++) {
+      b
+      c
+    }
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn for_stmt_test1() {
+        let ast = parse(
+            "
+    for(i = 0;; i++) {} a
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn for_stmt_test2() {
+        let ast = parse(
+            "
+    for(;;) {} a
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn while_stmt_test() {
+        let ast = parse(
+            "
+    while(a > 1) { a } a
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn do_while_stmt_test() {
+        let ast = parse(
+            "
+    do { a-- } while(a > 0) a
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn break_stmt_test() {
+        let ast = parse(
+            "
+    for(;;) {
+      for(;;) {
+        if(a) { break }
+        1
+      }
+      2
+      if(b) break
+      3
+    }
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn cont_stmt_test() {
+        let ast = parse(
+            "
+    for(b;;) {
+      for(;;) {
+        if(a) { continue }
+        else break
+      }
+      1
+      if(b) continue
+      else break
+    }
+    2
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn call_expr_test() {
+        let ast = parse(
+            "
+    print(a,b)
+    print(add(a,b),1)
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+
+    #[test]
+    fn return_stmt_test() {
+        let ast = parse(
+            "
+    return add(a,b)
+    return
+    ",
+        );
+        let mut symtab = SymTab::new();
+        symtab.prog(&ast).unwrap();
+
+        let mut codegen = Codegen::new(symtab);
+        codegen.prog(&ast).ok();
+    }
+}
