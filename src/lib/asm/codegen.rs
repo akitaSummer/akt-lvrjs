@@ -1511,7 +1511,7 @@ impl AstVisitor<(), CodegenError> for Codegen {
 
         let mut inst = Inst::new();
         inst.set_op(OpCode::LOADBOO);
-        inst.set_a(res_reg);
+        inst.set_a(res_reg);  
         inst.set_b(if expr.value { 1 } else { 0 });
         fs.push_inst(inst);
         fs.free_regs(&tmp_regs);

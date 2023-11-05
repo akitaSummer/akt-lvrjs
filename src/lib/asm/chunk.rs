@@ -220,7 +220,7 @@ impl Inst {
         self.raw = (self.raw & !(0x3ffff << 14)) | (sbx << 14);
     }
 
-    // converts an integer to a "floating point byte", from CLua
+    // converts an integer to a "floating point byte"
     pub fn int2fb(mut x: u32) -> u32 {
         let mut e = 0; /* exponent */
         if x < 8 {
